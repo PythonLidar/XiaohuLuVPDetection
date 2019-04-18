@@ -1,6 +1,11 @@
 # XiaohuLuVPDetection
 This is a Python + OpenCV implementation of the Vanishing Point algorithm by Xiaohu Lu et al. - http://xiaohulugo.github.io/papers/Vanishing_Point_Detection_WACV2017.pdf
 
+# `develop` branch
+This branch is for additions to the algorithm that are not part of the original algorithm, but
+would be considered as extra features to help improve the performance of the algorithm, or provide
+extra support in understanding the algorithm.
+
 # Requirements
 * Python 3
 * OpenCV 3.x
