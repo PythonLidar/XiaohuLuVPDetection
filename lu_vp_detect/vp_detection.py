@@ -390,9 +390,9 @@ class vp_detection(object):
         vps_2D = self._focal_length * (final_vps[:, :2] / final_vps[:, 2][:, None])
         vps_2D += self._principal_point
 
-        # Find the coordinate with the largest vertical value
+        # Find the coordinate with the largest vertical value in 3D VPs
         # This will be the last column of the output
-        z_idx = np.argmax(np.abs(vps_2D[:, 1]))
+        z_idx = np.argmax(np.abs(final_vps[:, 1]))
         ind = np.arange(3).astype(np.int)
         mask = np.ones(3, dtype=np.bool)
         mask[z_idx] = False
@@ -414,6 +414,11 @@ class vp_detection(object):
         # Vertical VP is third - z-axis would be vertical
         final_vps = final_vps[[x2_idx, x_idx, z_idx], :]
         vps_2D = vps_2D[[x2_idx, x_idx, z_idx], :]
+
+        # Redo the cross product again to ensure the right_hand order
+        final_vps[2] = np.cross(final_vps[0], final_vps[1])
+        vps_2D = self._focal_length * (final_vps[:, :2] / final_vps[:, 2][:, None])
+        vps_2D += self._principal_point
 
         # Save for later
         self._vps = final_vps
