@@ -8,6 +8,7 @@ Author: Ray Phan (https://github.com/rayryeng)
 import cv2
 import numpy as np
 from itertools import combinations
+import copy
 
 class vp_detection(object):
     """
@@ -20,7 +21,7 @@ class vp_detection(object):
         seed: Seed for reproducibility due to RANSAC
     """
     def __init__(self, length_thresh=30, principal_point=None,
-                 focal_length=1500, seed=None):
+                 focal_length=1500, seed=None, is_one_star = False):
         self._length_thresh = length_thresh
         self._principal_point = principal_point
         self._focal_length = focal_length
@@ -32,6 +33,7 @@ class vp_detection(object):
         self.__tol = 1e-8 # Tolerance for floating point comparison
         self.__angle_tol = np.pi / 3 # (pi / 180 * (60 degrees)) --> +/- 30 deg
         self.__lines = None # Stores the line detections internally
+        self.__all_lines = None  # Stores the line detections without filtering internally
         self.__zero_value = 0.001 # Threshold to check augmented coordinate
                                   # Anything less than __tol gets set to this
         self.__seed = seed # Set seed for reproducibility
@@ -42,6 +44,14 @@ class vp_detection(object):
         # Total number of iterations for RANSAC
         conf = 0.9999
         self.__ransac_iter = int(np.log(1 - conf) / np.log(1.0 - p))
+
+        # for short line joining
+        self._dist_length_ratio = 1
+        self._angle_join_threshold = 3
+
+        # for one star image
+        self.is_one_star = is_one_star
+        self.image_normal = np.array([0, 0, 1.0])
 
     @property
     def length_thresh(self):
@@ -96,7 +106,7 @@ class vp_detection(object):
         except AssertionError:
             raise ValueError('Invalid principal point: {}'.format(value))
 
-        self._length_thresh = value
+        self._principal_point = value
 
     @property
     def focal_length(self):
@@ -144,6 +154,104 @@ class vp_detection(object):
         """
         return self._vps_2D
 
+    # join short lines for one angle group
+    def join_short_lines(self, group_lines, group_angle_i):
+        new_lines = []
+
+        # sort the lines by the first points' x value
+        def custom_sort(t):
+            return t[0]
+
+        group_lines.sort(key=custom_sort)
+
+        # start from the first and doing flooding prolonging
+        for i, line_i in enumerate(group_lines):
+            if i == len(group_lines) - 1:
+                break
+            joined_line = copy.deepcopy(line_i)
+            # prolong the line by adding things within dist and within angle_thresh
+            start_x = joined_line[2]
+            start_y = joined_line[3]
+            x1 = joined_line[2]
+            y1 = joined_line[3]
+            for k, line_k in enumerate(group_lines[i + 1:]):
+                x2 = line_k[0]
+                y2 = line_k[1]
+                dx = x2 - x1
+                dy = y2 - y1
+                dist_12 = np.sqrt(dx * dx + dy * dy)
+                if dist_12 > self._short_dis_thresh:  # the end point connection is too long
+                    break
+                angle_k_1 = np.arctan2(x2 - start_x, y2 - start_y)
+                # transfer to degree
+                angle_k_1 *= 180 / np.pi
+                if angle_k_1 < 0:
+                    angle_k_1 += 180
+                if np.abs(angle_k_1 - group_angle_i) > self._angle_join_threshold:  # diverge too much
+                    break
+                x3 = line_k[2]
+                y3 = line_k[3]
+                angle_k_2 = np.arctan2(x3 - start_x, y3 - start_y)
+                # transfer to degree
+                angle_k_2 *= 180 / np.pi
+                if angle_k_2 < 0:
+                    angle_k_2 += 180
+                if np.abs(angle_k_2 - group_angle_i) > self._angle_join_threshold:  # diverge too much
+                    break
+                # if all three checks are passed, change the join_line's right points
+                joined_line[2] = x3
+                joined_line[3] = y3
+                x1 = x3
+                y1 = y3
+
+            # in the end, determine whether add the line by its length
+            dx = joined_line[2] - joined_line[0]
+            dy = joined_line[3] - joined_line[1]
+            length_i = np.sqrt(dx * dx + dy * dy)
+            if length_i > self._length_thresh:
+                new_lines.append(joined_line)
+
+        return new_lines
+
+    # only do joining among short lines
+    def add_lines_from_join_short_lines(self, short_lines):
+
+        add_lines = []
+        # cal the angles of the lines
+        dx = short_lines[:, 2] - short_lines[:, 0]
+        dy = short_lines[:, 3] - short_lines[:, 1]
+        orientations = np.arctan2(dx, dy)
+
+        # Perform wraparound - [-pi, pi] --> [0, pi]
+        # All negative angles map to their mirrored positive counterpart
+        orientations[orientations < 0] = orientations[orientations < 0] + np.pi
+
+        # transfer to degree
+        orientations *= 180 / np.pi
+
+        # angle groups 1, 2, 3, ..., 180,
+        angle_group_dict = {}
+        angle_list = np.array(list(range(1, 181)))
+
+        # group lines by angles
+        for i, ang_i in enumerate(orientations):
+            ang_diff = np.abs(angle_list - ang_i)
+            ang_bin_i = np.argmin(ang_diff)
+            if ang_bin_i not in angle_group_dict:
+                angle_group_dict[ang_bin_i] = [short_lines[i]]
+            else:
+                angle_group_dict[ang_bin_i].append(short_lines[i])
+
+        # get the joined lines from each group
+        for angle_i, group_i in angle_group_dict.items():
+            add_lines_i = self.join_short_lines(group_i, angle_i)
+            if len(add_lines_i) > 0:
+                add_lines.extend(add_lines_i)
+
+        # transfer to array
+        add_lines = np.array(add_lines)
+        return add_lines
+
     def __detect_lines(self, img):
         """
         Detects lines using OpenCV LSD Detector
@@ -166,15 +274,41 @@ class vp_detection(object):
         # Remove singleton dimension
         lines = lines[:, 0]
 
+        # Make sure the lines' first endpoint is on the left
+        for l_i in range(len(lines)):
+            x1 = lines[l_i][0]
+            y1 = lines[l_i][1]
+            x2 = lines[l_i][2]
+            y2 = lines[l_i][3]
+            if x1 > x2:
+                # switch
+                lines[l_i][0], lines[l_i][1], lines[l_i][2], lines[l_i][3] = x2, y2, x1, y1
+
+        # Store all lines without filtering
+        self.__all_lines = lines
+
+        # get line threshold from the image size
+        self._length_thresh = np.sqrt(img.shape[0] + img.shape[1]) / 1.7
+        self._short_dis_thresh = self._length_thresh / self._dist_length_ratio
+
         # Filter out the lines whose length is lower than the threshold
         dx = lines[:, 2] - lines[:, 0]
         dy = lines[:, 3] - lines[:, 1]
         lengths = np.sqrt(dx*dx + dy*dy)
         mask = lengths >= self._length_thresh
+        short_mask = lengths < self._length_thresh
         lines = lines[mask]
+        short_lines = self.__all_lines[short_mask]
+
+        # Add lines from join the short lines
+        self._add_lines = self.add_lines_from_join_short_lines(short_lines)
 
         # Store the lines internally
-        self.__lines = lines
+        if len(self._add_lines) > 0:
+            self.__lines = np.concatenate((lines, self._add_lines), axis=0)
+            lines = self.__lines
+        else:
+            self.__lines = lines
 
         # Return the lines
         return lines
@@ -380,8 +514,30 @@ class vp_detection(object):
         # votes by summing the contributions of each VP for the
         # hypothesis
         weights = sphere_grid[la_bin, lon_bin]
-        votes = np.bincount(ids, weights=weights,
-            minlength=N).astype(np.float32)
+
+        # 1 modify one star with adding missing suport and product rule
+        # 2 modify two star with product rule
+        if self.is_one_star:
+            for i in range(N):
+                self.__missing_weight[i] = weights[i * 3] * weights[i * 3 + 1] * self.__missing_weight[i]
+        else:
+            self.__joint_weight = np.zeros(N)
+            for i in range(N):
+                self.__joint_weight[i] = weights[i * 3] * weights[i * 3 + 1] * weights[i * 3 + 2]
+
+        # votes = np.bincount(ids, weights=weights,
+        #     minlength=N).astype(np.float32)
+
+        if self.is_one_star:
+            print("Doing one star with product")
+            ids = ids[::3]
+            votes = np.bincount(ids, weights=self.__missing_weight,
+                                minlength=N).astype(np.float32)
+        else:
+            print("Doing two star with product")
+            ids = ids[::3]
+            votes = np.bincount(ids, weights=self.__joint_weight,
+                                minlength=N).astype(np.float32)
 
         # Find best hypothesis by determining which triplet has the largest
         # votes
@@ -481,6 +637,32 @@ class vp_detection(object):
         # Each element contains which line index corresponds to which VP
         self.__clusters = [np.where(np.logical_and(mask, idx_ang == i))[0] for i in range(3)]
 
+    def reorder_vps_hypos(self):
+        print("Process - number of sets to reorder", len(self.__vps_hypos))
+        self.__missing_weight = np.zeros(len(self.__vps_hypos))
+        # switch the order of these three vps
+        for i, vps_i in enumerate(self.__vps_hypos):
+            vps = [copy.deepcopy(self.__vps_hypos[i][0]), copy.deepcopy(self.__vps_hypos[i][1]), copy.deepcopy(self.__vps_hypos[i][2])]
+            missing_i = 0
+            # find which one is closest to image normal
+            missing_i = 0
+            weight_i = -1
+            for k in range(3):
+                vp_norm_i = vps[k] / np.linalg.norm(vps[k])
+                weight_t = np.abs(vp_norm_i.dot(self.image_normal))
+                if weight_t > weight_i:
+                    missing_i = k
+                    weight_i = weight_t
+            #set the weight
+            self.__missing_weight[i] = weight_i
+            if missing_i == 2:
+                # don't need to switch
+                pass
+            else:
+                # switch
+                self.__vps_hypos[i][2] = vps[missing_i]
+                self.__vps_hypos[i][missing_i] = vps[2]
+
     def find_vps(self, img):
         """
         Find the vanishing points given the input image
@@ -516,6 +698,9 @@ class vp_detection(object):
 
         # Map VP candidates to sphere
         sphere_grid = self.__get_sphere_grids()
+
+        if self.is_one_star:
+            self.reorder_vps_hypos()
 
         # Find the final VPs
         best_vps = self.__get_best_vps_hypo(sphere_grid, vps_hypos)
